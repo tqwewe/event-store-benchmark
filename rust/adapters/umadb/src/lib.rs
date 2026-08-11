@@ -59,6 +59,11 @@ impl StoreManager for UmaDbStoreManager {
                 });
             }
 
+            // At small (e.g. 16 MiB) segment sizes a multi-GB run produces hundreds of segment
+            // files, and these engines hold file handles per segment; raise the container's
+            // open-file limit so fds — not concurrency — are never the bottleneck (mirrors tephra).
+            image = image.with_ulimit("nofile", 1_048_576, Some(1_048_576));
+
             let container = image.start().await?;
 
             let host_port = container.get_host_port_ipv4(UMADB_PORT).await?;
@@ -110,6 +115,14 @@ impl StoreManager for UmaDbStoreManager {
 
     fn name(&self) -> &'static str {
         "umadb"
+    }
+
+    fn describe(&self) -> serde_json::Value {
+        let mut desc = UmaDb::describe();
+        if let Some(limit_mb) = self.memory_limit_mb {
+            desc["memory_limit_mb"] = serde_json::json!(limit_mb);
+        }
+        desc
     }
 
     async fn create_adapter(&mut self) -> Result<Arc<dyn EventStoreAdapter>> {
@@ -208,15 +221,27 @@ impl EventStoreAdapter for UmaDbAdapter {
     }
 
     async fn read_stream(&self, req: ReadRequest) -> Result<Vec<ReadEvent>> {
-        let query = DcbQuery {
-            items: vec![DcbQueryItem {
-                types: if req.event_type.is_some() {vec![req.event_type.expect("event type").into()]} else {vec![]},
-                tags: vec![req.tag],
-            }],
+        // An empty tag and no event type means "no filter" (full scan). Passing an empty-string
+        // tag would otherwise match nothing, so build the query from only the set fields and
+        // send `None` when neither is present, matching the tephra adapter's semantics.
+        let mut types = Vec::new();
+        if let Some(event_type) = req.event_type {
+            types.push(event_type);
+        }
+        let mut tags = Vec::new();
+        if !req.tag.is_empty() {
+            tags.push(req.tag);
+        }
+        let query = if types.is_empty() && tags.is_empty() {
+            None
+        } else {
+            Some(DcbQuery {
+                items: vec![DcbQueryItem { types, tags }],
+            })
         };
         let mut rr = self.client
             .read(
-                Some(query),
+                query,
                 req.from_offset,
                 false,
                 req.limit.map(|l| l as u32),
