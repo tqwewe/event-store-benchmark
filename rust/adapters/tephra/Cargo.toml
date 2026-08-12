@@ -10,10 +10,13 @@ libc = "0.2"
 bench-core = { path = "../../bench-core" }
 bench-testcontainers = { path = "../../testcontainers" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-stream = "0.1"
 tracing = "0.1"
 serde_json = "1"
 testcontainers = "0.27"
 
-# tephra is not published to crates.io; pull the client crate straight from the public repo,
-# pinned to a rev for reproducible builds. https://github.com/tqwewe/tephra
-tephra-client = { git = "https://github.com/tqwewe/tephra", rev = "b5d2d9642bc891bc14480750719a040029e025d8" }
+# tephra 0.2.1 (async multiplexing client + server-side read limit + bounded in-flight requests),
+# published to crates.io. AsyncClient::connect uses AsyncClientConfig::default(), which caps
+# max_inflight_requests (1024) so a write flood applies backpressure instead of dropping the
+# connection. Matching server image: ghcr.io/tqwewe/tephra:0.2.1 (see bench/hetzner/setup-tephra.sh).
+tephra-client = { version = "0.2.1", features = ["async"] }

@@ -5,16 +5,16 @@ use bench_core::adapter::{
     StoreDataDir, StoreManager, StoreManagerFactory,
 };
 use bench_core::wait_for_ready;
-use bench_testcontainers::tephra::{pool_size, Tephra, TEPHRA_PORT};
-use tephra_client::{
-    AppendCondition, Client, Event, EventType, Position, Query, QueryItem, Tag, Tags,
-};
+use bench_testcontainers::tephra::{Tephra, TEPHRA_PORT};
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
-use tokio::sync::Semaphore;
+use std::sync::Arc;
+use tephra_client::{
+    AppendCondition, AsyncClient, Client, Event, EventType, Position, Query, QueryItem, Tag, Tags,
+};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ContainerRequest, ImageExt};
 use tokio::time::Duration;
+use tokio_stream::StreamExt;
 
 // Store manager - handles lifecycle and adapter creation.
 pub struct TephraStoreManager {
@@ -95,7 +95,7 @@ impl StoreManager for TephraStoreManager {
                             let mut client =
                                 Client::connect(&addr).map_err(|err| anyhow!("{err}"))?;
                             client
-                                .read_all(Query::all(), Position::ZERO)
+                                .read_all(Query::all(), Position::ZERO, Some(1))
                                 .map_err(|err| anyhow!("{err}"))?;
                             Ok::<(), anyhow::Error>(())
                         })
@@ -168,84 +168,26 @@ impl StoreManager for TephraStoreManager {
     }
 }
 
-/// Adapter over a lazily-grown pool of blocking tephra client connections.
+/// Adapter over a single multiplexing async tephra client connection.
 ///
-/// The tephra client is synchronous and answers one request at a time per connection, and
-/// tephra-server is sequential per connection (it reads the next frame only after the current
-/// append is durable). So a single connection can hold just one in-flight append — a worker
-/// driving `in_flight_limit` concurrent ops (writeflood) would collapse to one, starving the
-/// server's group commit. The adapter therefore keeps a pool of independent connections (the same
-/// shape the Marten adapter uses for Postgres) and checks one out per operation, so concurrent ops
-/// actually run concurrently.
-///
-/// The pool grows on demand up to [`pool_size`] (`ESB_TEPHRA_POOL_SIZE`, default 16): a permit
-/// bounds live connections at that cap, and a connection is only opened when an op finds none idle.
-/// A worker that never runs two ops at once (every reader, and non-flood writers) therefore opens
-/// exactly one connection, so read workloads keep their previous single-connection footprint. The
-/// blocking calls run on tokio's blocking pool.
+/// The benchmark harness creates one adapter PER worker (`performance.rs`), so one `AsyncClient`
+/// here means one socket per worker — the idiomatic async equivalent of the old blocking adapter's
+/// per-worker connection pool, since a single multiplexed socket already carries that worker's
+/// concurrent in-flight ops. (A pool here would multiply by worker count — 64 workers × 16 = 1024
+/// sockets — which is what flooded the server, not deep pipelining.) 0.2.1's `AsyncClientConfig`
+/// default bounds `max_inflight_requests`, so a fast producer backpressures instead of dropping the
+/// connection. Reads push the harness `limit` down to the server so a selective read materializes
+/// only `limit` events instead of the whole match.
 pub struct TephraAdapter {
-    addr: String,
-    /// One permit per allowed connection; held for the duration of an op, so at most `pool_size`
-    /// connections are ever live. Ops beyond the cap wait here (natural backpressure).
-    permits: Arc<Semaphore>,
-    /// Idle connections available for reuse. The `std` mutex is only held for the brief
-    /// pop/push (never across an `.await`).
-    idle: Arc<Mutex<Vec<Client>>>,
+    client: AsyncClient,
 }
 
 impl TephraAdapter {
     pub async fn connect(addr: String) -> Result<Self> {
-        // Validate connectivity up front with one connection, kept as the pool's first member; the
-        // rest are opened lazily as concurrency demands.
-        let first_addr = addr.clone();
-        let client = tokio::task::spawn_blocking(move || {
-            Client::connect(&first_addr).map_err(|err| anyhow!("{err}"))
-        })
-        .await??;
-        Ok(Self {
-            addr,
-            permits: Arc::new(Semaphore::new(pool_size())),
-            idle: Arc::new(Mutex::new(vec![client])),
-        })
-    }
-
-    /// Checks out a connection (reusing an idle one, or opening a new one up to the pool cap, or
-    /// waiting for one to free up), runs a blocking closure against it on tokio's blocking pool,
-    /// then returns it to the pool.
-    async fn with_client<F, T>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce(&mut Client) -> Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        // The permit bounds concurrent connections to the pool size; it is held until the
-        // connection is returned, so a waiter that acquires it sees a freed connection.
-        let permit = Arc::clone(&self.permits)
-            .acquire_owned()
+        let client = AsyncClient::connect(&addr)
             .await
-            .map_err(|_| anyhow!("tephra connection pool closed"))?;
-        let existing = self.idle.lock().expect("tephra pool mutex poisoned").pop();
-        let mut client = match existing {
-            Some(client) => client,
-            None => {
-                let addr = self.addr.clone();
-                tokio::task::spawn_blocking(move || {
-                    Client::connect(&addr).map_err(|err| anyhow!("{err}"))
-                })
-                .await??
-            }
-        };
-        // The closure owns the connection for the blocking call and hands it back with the result.
-        let (client, result) = tokio::task::spawn_blocking(move || {
-            let result = f(&mut client);
-            (client, result)
-        })
-        .await?;
-        self.idle
-            .lock()
-            .expect("tephra pool mutex poisoned")
-            .push(client);
-        drop(permit);
-        result
+            .map_err(|err| anyhow!("{err}"))?;
+        Ok(Self { client })
     }
 
     /// Convert the benchmark's `EventData` into validated tephra `Event`s.
@@ -254,8 +196,12 @@ impl TephraAdapter {
             .iter()
             .map(|evt| {
                 let tags: Vec<&str> = evt.tags.iter().map(|t| t.as_ref()).collect();
-                Event::new(evt.event_type.as_ref(), &tags, evt.payload.as_ref().to_vec())
-                    .map_err(|err| anyhow!("{err}"))
+                Event::new(
+                    evt.event_type.as_ref(),
+                    &tags,
+                    evt.payload.as_ref().to_vec(),
+                )
+                .map_err(|err| anyhow!("{err}"))
             })
             .collect()
     }
@@ -309,13 +255,12 @@ impl EventStoreAdapter for TephraAdapter {
             None => None,
         };
 
-        self.with_client(move |client| {
-            let resp = client
-                .append(events, condition)
-                .map_err(|err| anyhow!("{err}"))?;
-            Ok(Some(resp.last.get()))
-        })
-        .await
+        let resp = self
+            .client
+            .append(events, condition)
+            .await
+            .map_err(|err| anyhow!("{err}"))?;
+        Ok(Some(resp.last.get()))
     }
 
     async fn append_to_stream(
@@ -346,13 +291,12 @@ impl EventStoreAdapter for TephraAdapter {
 
         let events = Self::convert_events(events)?;
 
-        self.with_client(move |client| {
-            let resp = client
-                .append(events, condition)
-                .map_err(|err| anyhow!("{err}"))?;
-            Ok(Some(resp.last.get()))
-        })
-        .await
+        let resp = self
+            .client
+            .append(events, condition)
+            .await
+            .map_err(|err| anyhow!("{err}"))?;
+        Ok(Some(resp.last.get()))
     }
 
     async fn read_stream(&self, req: ReadRequest) -> Result<Vec<ReadEvent>> {
@@ -377,29 +321,26 @@ impl EventStoreAdapter for TephraAdapter {
         let after = Position::new(req.from_offset.unwrap_or(0));
         let limit = req.limit;
 
-        self.with_client(move |client| {
-            let mut stream = client.read(query, after).map_err(|err| anyhow!("{err}"))?;
-            let mut out = Vec::new();
-            for item in stream.by_ref() {
-                if let Some(lim) = limit {
-                    if out.len() as u64 >= lim {
-                        break;
-                    }
+        // Push the limit down to the server (new ReadRequest.limit) so it materializes only
+        // `limit` matched events. The client-side cap below is now redundant but harmless.
+        let mut stream = self.client.read(query, after, limit).await;
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let sequenced = item.map_err(|err| anyhow!("{err}"))?;
+            let event = sequenced.event();
+            out.push(ReadEvent {
+                offset: sequenced.position().get(),
+                event_type: event.event_type().to_string(),
+                payload: event.payload().to_vec(),
+                metadata: Vec::new(),
+            });
+            if let Some(lim) = limit {
+                if out.len() as u64 >= lim {
+                    break;
                 }
-                let sequenced = item.map_err(|err| anyhow!("{err}"))?;
-                let event = sequenced.event();
-                out.push(ReadEvent {
-                    offset: sequenced.position().get(),
-                    event_type: event.event_type().to_string(),
-                    payload: event.payload().to_vec(),
-                    metadata: Vec::new(),
-                });
             }
-            // Dropping the partially-consumed stream drains the rest, keeping the connection
-            // frame-aligned for the next request.
-            Ok(out)
-        })
-        .await
+        }
+        Ok(out)
     }
 }
 
